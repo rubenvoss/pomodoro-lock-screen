@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import PomodoroLockScreenCore
 
 private enum PomodoroMode {
     case focus
@@ -21,7 +22,12 @@ private protocol TimerPopoverViewControllerDelegate: AnyObject {
     func timerPopoverDidToggleRunning(_ controller: TimerPopoverViewController)
     func timerPopoverDidReset(_ controller: TimerPopoverViewController)
     func timerPopoverDidSkip(_ controller: TimerPopoverViewController)
-    func timerPopover(_ controller: TimerPopoverViewController, didApplyFocusMinutes focusMinutes: Int, breakMinutes: Int)
+    func timerPopover(
+        _ controller: TimerPopoverViewController,
+        didApplyFocusMinutes focusMinutes: Int,
+        breakMinutes: Int,
+        warningFocusRounds: Int
+    )
     func timerPopoverDidRequestLock(_ controller: TimerPopoverViewController)
     func timerPopoverDidRequestQuit(_ controller: TimerPopoverViewController)
 }
@@ -37,6 +43,7 @@ private final class TimerPopoverViewController: NSViewController {
     private let skipButton = NSButton(title: "Skip", target: nil, action: nil)
     private let focusMinutesField = NSTextField(string: "25")
     private let breakMinutesField = NSTextField(string: "5")
+    private let warningFocusRoundsField = NSTextField(string: "3")
     private let applyButton = NSButton(title: "Apply", target: nil, action: nil)
     private let lockButton = NSButton(title: "Lock Now", target: nil, action: nil)
     private let quitButton = NSButton(title: "Quit", target: nil, action: nil)
@@ -61,6 +68,7 @@ private final class TimerPopoverViewController: NSViewController {
         configure(quitButton, action: #selector(quit))
         configureMinuteField(focusMinutesField)
         configureMinuteField(breakMinutesField)
+        configureCountField(warningFocusRoundsField)
 
         let controls = NSStackView(views: [toggleButton, resetButton, skipButton])
         controls.orientation = .horizontal
@@ -77,12 +85,21 @@ private final class TimerPopoverViewController: NSViewController {
         durationControls.distribution = .fill
         durationControls.spacing = 8
 
+        let warningControls = NSStackView(views: [
+            warningField(title: "Warn after", field: warningFocusRoundsField),
+            NSTextField(labelWithString: "focus rounds")
+        ])
+        warningControls.orientation = .horizontal
+        warningControls.alignment = .centerY
+        warningControls.distribution = .fill
+        warningControls.spacing = 6
+
         let secondaryControls = NSStackView(views: [lockButton, quitButton])
         secondaryControls.orientation = .horizontal
         secondaryControls.distribution = .fillEqually
         secondaryControls.spacing = 8
 
-        let stack = NSStackView(views: [modeLabel, timeLabel, durationControls, controls, secondaryControls])
+        let stack = NSStackView(views: [modeLabel, timeLabel, durationControls, warningControls, controls, secondaryControls])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
@@ -91,12 +108,13 @@ private final class TimerPopoverViewController: NSViewController {
         view.addSubview(stack)
 
         NSLayoutConstraint.activate([
-            view.widthAnchor.constraint(equalToConstant: 240),
+            view.widthAnchor.constraint(equalToConstant: 280),
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 16),
             stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -16),
             durationControls.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            warningControls.widthAnchor.constraint(equalTo: stack.widthAnchor),
             toggleButton.heightAnchor.constraint(equalToConstant: 32),
             resetButton.heightAnchor.constraint(equalTo: toggleButton.heightAnchor),
             skipButton.heightAnchor.constraint(equalTo: toggleButton.heightAnchor),
@@ -106,8 +124,25 @@ private final class TimerPopoverViewController: NSViewController {
         ])
     }
 
-    func update(mode: PomodoroMode, remainingSeconds: Int, isRunning: Bool, focusMinutes: Int, breakMinutes: Int) {
-        modeLabel.stringValue = mode.label
+    func update(
+        mode: PomodoroMode,
+        activityState: FocusActivityState,
+        remainingSeconds: Int,
+        isRunning: Bool,
+        focusMinutes: Int,
+        breakMinutes: Int,
+        warningFocusRounds: Int,
+        currentFocusRound: Int
+    ) {
+        let stateText: String
+        switch mode {
+        case .focus:
+            stateText = activityState == .active ? "Focus - Active" : "Focus - Paused"
+        case .breakTime:
+            stateText = activityState == .active ? "Break - Active" : "Break - Paused"
+        }
+
+        modeLabel.stringValue = "\(stateText) - Round \(currentFocusRound)/\(warningFocusRounds)"
         timeLabel.stringValue = Self.format(seconds: remainingSeconds)
         toggleButton.title = isRunning ? "Pause" : "Start"
 
@@ -117,6 +152,10 @@ private final class TimerPopoverViewController: NSViewController {
 
         if breakMinutesField.currentEditor() == nil {
             breakMinutesField.stringValue = "\(breakMinutes)"
+        }
+
+        if warningFocusRoundsField.currentEditor() == nil {
+            warningFocusRoundsField.stringValue = "\(warningFocusRounds)"
         }
     }
 
@@ -144,7 +183,35 @@ private final class TimerPopoverViewController: NSViewController {
         field.widthAnchor.constraint(equalToConstant: 42).isActive = true
     }
 
+    private func configureCountField(_ field: NSTextField) {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .none
+        formatter.minimum = 1
+        formatter.maximum = 24
+        formatter.allowsFloats = false
+
+        field.formatter = formatter
+        field.alignment = .center
+        field.controlSize = .small
+        field.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        field.target = self
+        field.action = #selector(applyDurations)
+        field.widthAnchor.constraint(equalToConstant: 36).isActive = true
+    }
+
     private func durationField(title: String, field: NSTextField) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [label, field])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 5
+        return stack
+    }
+
+    private func warningField(title: String, field: NSTextField) -> NSStackView {
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor
@@ -173,7 +240,8 @@ private final class TimerPopoverViewController: NSViewController {
         delegate?.timerPopover(
             self,
             didApplyFocusMinutes: Self.clampedMinutes(from: focusMinutesField),
-            breakMinutes: Self.clampedMinutes(from: breakMinutesField)
+            breakMinutes: Self.clampedMinutes(from: breakMinutesField),
+            warningFocusRounds: Self.clampedCount(from: warningFocusRoundsField)
         )
     }
 
@@ -193,6 +261,11 @@ private final class TimerPopoverViewController: NSViewController {
     private static func clampedMinutes(from field: NSTextField) -> Int {
         let value = field.integerValue
         return min(max(value, 1), 240)
+    }
+
+    private static func clampedCount(from field: NSTextField) -> Int {
+        let value = field.integerValue
+        return min(max(value, 1), 24)
     }
 }
 
@@ -291,10 +364,6 @@ private final class CompletionSoundRunner {
                 playedEffect = true
             }
 
-            if run(Command(path: "/usr/bin/say", arguments: ["bruh"])) {
-                playedEffect = true
-            }
-
             if !playedEffect {
                 NSSound.beep()
             }
@@ -321,23 +390,115 @@ private final class CompletionSoundRunner {
 }
 
 @MainActor
+private final class InputActivityMonitor {
+    private let activeThreshold: TimeInterval
+    private let movementThreshold: CGFloat = 1
+    private var lastInputAt: Date
+    private var lastMouseLocation: NSPoint
+    private var monitorTokens: [Any] = []
+
+    init(activeThreshold: TimeInterval = 10) {
+        self.activeThreshold = activeThreshold
+        self.lastInputAt = Date()
+        self.lastMouseLocation = NSEvent.mouseLocation
+    }
+
+    func start() {
+        guard monitorTokens.isEmpty else {
+            return
+        }
+
+        let mask: NSEvent.EventTypeMask = [
+            .mouseMoved,
+            .leftMouseDown,
+            .leftMouseUp,
+            .leftMouseDragged,
+            .rightMouseDown,
+            .rightMouseUp,
+            .rightMouseDragged,
+            .otherMouseDown,
+            .otherMouseUp,
+            .otherMouseDragged,
+            .scrollWheel,
+            .keyDown,
+            .flagsChanged
+        ]
+
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            Task { @MainActor in
+                self?.registerInput(event: event)
+            }
+            return event
+        }) {
+            monitorTokens.append(localMonitor)
+        }
+
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            Task { @MainActor in
+                self?.registerInput(event: event)
+            }
+        }) {
+            monitorTokens.append(globalMonitor)
+        }
+    }
+
+    func isActive(now: Date = Date()) -> Bool {
+        refreshMousePosition()
+        return now.timeIntervalSince(lastInputAt) <= activeThreshold
+    }
+
+    func idleSeconds(now: Date = Date()) -> Int {
+        refreshMousePosition()
+        return max(0, Int(now.timeIntervalSince(lastInputAt).rounded(.down)))
+    }
+
+    func refreshMousePosition() {
+        let location = NSEvent.mouseLocation
+
+        guard location.distance(to: lastMouseLocation) >= movementThreshold else {
+            return
+        }
+
+        lastMouseLocation = location
+        lastInputAt = Date()
+    }
+
+    private func registerInput(event: NSEvent) {
+        switch event.type {
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            refreshMousePosition()
+        default:
+            lastMouseLocation = NSEvent.mouseLocation
+            lastInputAt = Date()
+        }
+    }
+}
+
+private extension NSPoint {
+    func distance(to other: NSPoint) -> CGFloat {
+        let horizontal = x - other.x
+        let vertical = y - other.y
+        return sqrt(horizontal * horizontal + vertical * vertical)
+    }
+}
+
+@MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverViewControllerDelegate {
-    private let chromeBundleIdentifier = "com.google.Chrome"
     private var focusDuration = 25 * 60
     private var breakDuration = 5 * 60
+    private var longWorkWarningFocusRounds = 3
+    private var roundWarningTracker = RoundWarningTracker()
+    private let activityMonitor = InputActivityMonitor()
+    private var focusTimer = ActivityGatedTimerPolicy(focusDurationSeconds: 25 * 60)
 
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private let popoverController = TimerPopoverViewController()
     private var timer: Timer?
     private var mode: PomodoroMode = .focus
-    private var remainingSeconds: Int
+    private var breakRemainingSeconds = 5 * 60
+    private var breakActivityState: FocusActivityState = .active
     private var isRunning = false
-
-    override init() {
-        remainingSeconds = focusDuration
-        super.init()
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -353,13 +514,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
-            selector: #selector(activeApplicationDidChange),
-            name: NSWorkspace.didActivateApplicationNotification,
+            selector: #selector(sessionDidBecomeActive),
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
             object: nil
         )
 
+        activityMonitor.start()
         updateDisplay()
-        startIfChromeIsFrontmost()
+        start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -375,16 +537,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
     }
 
     func timerPopoverDidSkip(_ controller: TimerPopoverViewController) {
-        advanceMode(lockOnFocusCompletion: false)
+        advanceMode(lockOnFocusCompletion: false, continueRunning: false)
     }
 
-    func timerPopover(_ controller: TimerPopoverViewController, didApplyFocusMinutes focusMinutes: Int, breakMinutes: Int) {
-        let previousCurrentDuration = duration(for: mode)
+    func timerPopover(
+        _ controller: TimerPopoverViewController,
+        didApplyFocusMinutes focusMinutes: Int,
+        breakMinutes: Int,
+        warningFocusRounds: Int
+    ) {
+        let previousFocusDuration = focusDuration
+        let previousBreakDuration = breakDuration
         focusDuration = focusMinutes * 60
         breakDuration = breakMinutes * 60
+        longWorkWarningFocusRounds = warningFocusRounds
+        roundWarningTracker.resetIfNewDay()
+        roundWarningTracker.clamp(threshold: longWorkWarningFocusRounds)
 
-        if !isRunning || previousCurrentDuration != duration(for: mode) {
-            remainingSeconds = duration(for: mode)
+        if mode == .focus {
+            focusTimer.applyDuration(
+                focusDurationSeconds: focusDuration,
+                resetFocus: !isRunning || previousFocusDuration != focusDuration
+            )
+        }
+
+        if mode == .breakTime && (!isRunning || previousBreakDuration != breakDuration) {
+            breakRemainingSeconds = breakDuration
         }
 
         updateDisplay()
@@ -412,30 +590,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
         }
     }
 
-    @objc private func activeApplicationDidChange(_ notification: Notification) {
-        guard
-            let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-        else {
-            return
-        }
-
-        startIfChrome(application)
-    }
-
-    private func startIfChromeIsFrontmost() {
-        guard let application = NSWorkspace.shared.frontmostApplication else {
-            return
-        }
-
-        startIfChrome(application)
-    }
-
-    private func startIfChrome(_ application: NSRunningApplication) {
-        guard application.bundleIdentifier == chromeBundleIdentifier, !isRunning else {
-            return
-        }
-
-        start()
+    @objc private func sessionDidBecomeActive(_ notification: Notification) {
+        updateDisplay()
     }
 
     private func start() {
@@ -451,7 +607,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
     }
 
     @objc private func timerFired(_ timer: Timer) {
-        tick()
+        switch mode {
+        case .focus:
+            tickFocus()
+        case .breakTime:
+            tickBreak()
+        }
     }
 
     private func pause() {
@@ -461,11 +622,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
         updateDisplay()
     }
 
-    private func tick() {
-        remainingSeconds -= 1
+    private func tickFocus() {
+        let action = focusTimer.tick(inputIsActive: activityMonitor.isActive())
 
-        if remainingSeconds <= 0 {
-            advanceMode(lockOnFocusCompletion: true)
+        switch action {
+        case .none:
+            updateDisplay()
+        case .focusExpired:
+            advanceMode(lockOnFocusCompletion: true, continueRunning: true)
+        }
+    }
+
+    private func tickBreak() {
+        guard activityMonitor.isActive() else {
+            breakActivityState = .paused
+            updateDisplay()
+            return
+        }
+
+        breakActivityState = .active
+        breakRemainingSeconds -= 1
+
+        if breakRemainingSeconds <= 0 {
+            advanceMode(lockOnFocusCompletion: false, continueRunning: true)
         } else {
             updateDisplay()
         }
@@ -473,12 +652,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
 
     private func resetCurrentMode() {
         pause()
-        remainingSeconds = duration(for: mode)
+
+        switch mode {
+        case .focus:
+            focusTimer.resetFocus(durationSeconds: focusDuration)
+        case .breakTime:
+            breakRemainingSeconds = breakDuration
+            breakActivityState = .active
+        }
+
         updateDisplay()
     }
 
-    private func advanceMode(lockOnFocusCompletion: Bool) {
+    private func advanceMode(lockOnFocusCompletion: Bool, continueRunning: Bool) {
         let completedMode = mode
+        let shouldShowLongWorkWarning = completedMode == .focus
+            && lockOnFocusCompletion
+            && registerCompletedFocusRoundIfNeeded()
 
         timer?.invalidate()
         timer = nil
@@ -486,42 +676,98 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
         switch mode {
         case .focus:
             mode = .breakTime
+            breakRemainingSeconds = breakDuration
+            breakActivityState = .active
         case .breakTime:
             mode = .focus
+            focusTimer.resetFocus(durationSeconds: focusDuration)
         }
 
-        remainingSeconds = duration(for: mode)
         isRunning = false
         CompletionSoundRunner.play()
 
+        if shouldShowLongWorkWarning {
+            showLongWorkWarning()
+        }
+
         if completedMode == .focus && lockOnFocusCompletion {
             LockScreenRunner.lockScreen()
+        }
+
+        if continueRunning {
             start()
         } else {
             updateDisplay()
         }
     }
 
-    private func duration(for mode: PomodoroMode) -> Int {
-        switch mode {
-        case .focus:
-            return focusDuration
-        case .breakTime:
-            return breakDuration
+    private func registerCompletedFocusRoundIfNeeded() -> Bool {
+        roundWarningTracker.registerCompletedRound(threshold: longWorkWarningFocusRounds)
+    }
+
+    private func showLongWorkWarning() {
+        if popover.isShown {
+            popover.performClose(nil)
         }
+
+        let focusedMinutes = (focusDuration / 60) * longWorkWarningFocusRounds
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Long work session"
+        alert.informativeText = "You have completed \(longWorkWarningFocusRounds) focus rounds, about \(focusedMinutes) minutes of focused work. Take a longer break before continuing."
+        alert.addButton(withTitle: "OK")
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func updateDisplay() {
+        roundWarningTracker.resetIfNewDay()
+
+        let remainingSeconds = displayedRemainingSeconds
         let timeText = format(seconds: remainingSeconds)
-        statusItem?.button?.title = timeText
-        statusItem?.button?.toolTip = "Pomodoro - \(mode.label) - \(timeText)"
+        let roundText = "\(roundWarningTracker.currentRoundNumber)/\(longWorkWarningFocusRounds)"
+        let stateText = displayStateText
+        let idleText = "idle \(activityMonitor.idleSeconds())s"
+        statusItem?.button?.title = "\(timeText) \(roundText)"
+        statusItem?.button?.toolTip = "Pomodoro - \(stateText) - \(timeText) - Round \(roundText) - \(idleText)"
         popoverController.update(
             mode: mode,
+            activityState: displayedActivityState,
             remainingSeconds: remainingSeconds,
             isRunning: isRunning,
             focusMinutes: focusDuration / 60,
-            breakMinutes: breakDuration / 60
+            breakMinutes: breakDuration / 60,
+            warningFocusRounds: longWorkWarningFocusRounds,
+            currentFocusRound: roundWarningTracker.currentRoundNumber
         )
+    }
+
+    private var displayedRemainingSeconds: Int {
+        switch mode {
+        case .focus:
+            return focusTimer.displayedRemainingSeconds
+        case .breakTime:
+            return breakRemainingSeconds
+        }
+    }
+
+    private var displayStateText: String {
+        switch mode {
+        case .focus:
+            return focusTimer.activityState == .active ? "Focus - Active" : "Focus - Paused"
+        case .breakTime:
+            return breakActivityState == .active ? "Break - Active" : "Break - Paused"
+        }
+    }
+
+    private var displayedActivityState: FocusActivityState {
+        switch mode {
+        case .focus:
+            return focusTimer.activityState
+        case .breakTime:
+            return breakActivityState
+        }
     }
 
     private func format(seconds: Int) -> String {
