@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import IOKit
 import PomodoroLockScreenCore
 
 private enum PomodoroMode {
@@ -392,93 +393,70 @@ private final class CompletionSoundRunner {
 @MainActor
 private final class InputActivityMonitor {
     private let activeThreshold: TimeInterval
-    private let movementThreshold: CGFloat = 1
-    private var lastInputAt: Date
-    private var lastMouseLocation: NSPoint
-    private var monitorTokens: [Any] = []
+    private let idleTimeReader: HIDIdleTimeReading
 
-    init(activeThreshold: TimeInterval = 10) {
+    init(activeThreshold: TimeInterval = 10, idleTimeReader: HIDIdleTimeReading = SystemHIDIdleTimeReader()) {
         self.activeThreshold = activeThreshold
-        self.lastInputAt = Date()
-        self.lastMouseLocation = NSEvent.mouseLocation
+        self.idleTimeReader = idleTimeReader
     }
 
     func start() {
-        guard monitorTokens.isEmpty else {
-            return
-        }
-
-        let mask: NSEvent.EventTypeMask = [
-            .mouseMoved,
-            .leftMouseDown,
-            .leftMouseUp,
-            .leftMouseDragged,
-            .rightMouseDown,
-            .rightMouseUp,
-            .rightMouseDragged,
-            .otherMouseDown,
-            .otherMouseUp,
-            .otherMouseDragged,
-            .scrollWheel,
-            .keyDown,
-            .flagsChanged
-        ]
-
-        if let localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
-            Task { @MainActor in
-                self?.registerInput(event: event)
-            }
-            return event
-        }) {
-            monitorTokens.append(localMonitor)
-        }
-
-        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
-            Task { @MainActor in
-                self?.registerInput(event: event)
-            }
-        }) {
-            monitorTokens.append(globalMonitor)
-        }
+        _ = idleTimeReader.idleDuration()
     }
 
-    func isActive(now: Date = Date()) -> Bool {
-        refreshMousePosition()
-        return now.timeIntervalSince(lastInputAt) <= activeThreshold
-    }
-
-    func idleSeconds(now: Date = Date()) -> Int {
-        refreshMousePosition()
-        return max(0, Int(now.timeIntervalSince(lastInputAt).rounded(.down)))
-    }
-
-    func refreshMousePosition() {
-        let location = NSEvent.mouseLocation
-
-        guard location.distance(to: lastMouseLocation) >= movementThreshold else {
-            return
+    func isActive() -> Bool {
+        guard let idleDuration = idleTimeReader.idleDuration() else {
+            return true
         }
 
-        lastMouseLocation = location
-        lastInputAt = Date()
+        return idleDuration < activeThreshold
     }
 
-    private func registerInput(event: NSEvent) {
-        switch event.type {
-        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            refreshMousePosition()
-        default:
-            lastMouseLocation = NSEvent.mouseLocation
-            lastInputAt = Date()
+    func idleSeconds() -> Int? {
+        guard let idleDuration = idleTimeReader.idleDuration() else {
+            return nil
         }
+
+        return max(0, Int(idleDuration.rounded(.down)))
+    }
+
+    func idleText() -> String {
+        guard let seconds = idleSeconds() else {
+            return "idle unavailable"
+        }
+
+        return "idle \(seconds)s"
     }
 }
 
-private extension NSPoint {
-    func distance(to other: NSPoint) -> CGFloat {
-        let horizontal = x - other.x
-        let vertical = y - other.y
-        return sqrt(horizontal * horizontal + vertical * vertical)
+private protocol HIDIdleTimeReading {
+    func idleDuration() -> TimeInterval?
+}
+
+private struct SystemHIDIdleTimeReader: HIDIdleTimeReading {
+    func idleDuration() -> TimeInterval? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        guard service != IO_OBJECT_NULL else {
+            return nil
+        }
+
+        defer {
+            IOObjectRelease(service)
+        }
+
+        guard
+            let property = IORegistryEntryCreateCFProperty(
+                service,
+                "HIDIdleTime" as CFString,
+                kCFAllocatorDefault,
+                0
+            )?.takeRetainedValue(),
+            let idleTime = property as? NSNumber
+        else {
+            return nil
+        }
+
+        return idleTime.doubleValue / 1_000_000_000
     }
 }
 
@@ -499,6 +477,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
     private var breakRemainingSeconds = 5 * 60
     private var breakActivityState: FocusActivityState = .active
     private var isRunning = false
+    private let debugActivityLoggingEnabled = ProcessInfo.processInfo.environment["POMODORO_DEBUG_ACTIVITY"] == "1"
+    private var lastDebugActivityLine: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -728,7 +708,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
         let timeText = format(seconds: remainingSeconds)
         let roundText = "\(roundWarningTracker.currentRoundNumber)/\(longWorkWarningFocusRounds)"
         let stateText = displayStateText
-        let idleText = "idle \(activityMonitor.idleSeconds())s"
+        let idleText = activityMonitor.idleText()
         statusItem?.button?.title = "\(timeText) \(roundText)"
         statusItem?.button?.toolTip = "Pomodoro - \(stateText) - \(timeText) - Round \(roundText) - \(idleText)"
         popoverController.update(
@@ -740,6 +720,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
             breakMinutes: breakDuration / 60,
             warningFocusRounds: longWorkWarningFocusRounds,
             currentFocusRound: roundWarningTracker.currentRoundNumber
+        )
+        logActivityStateIfNeeded(
+            stateText: stateText,
+            timeText: timeText,
+            roundText: roundText,
+            idleText: idleText
         )
     }
 
@@ -773,6 +759,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, TimerPopoverVi
     private func format(seconds: Int) -> String {
         let clamped = max(0, seconds)
         return String(format: "%02d:%02d", clamped / 60, clamped % 60)
+    }
+
+    private func logActivityStateIfNeeded(
+        stateText: String,
+        timeText: String,
+        roundText: String,
+        idleText: String
+    ) {
+        guard debugActivityLoggingEnabled else {
+            return
+        }
+
+        let line = "activity-debug state=\(stateText) time=\(timeText) round=\(roundText) running=\(isRunning) \(idleText)"
+        guard line != lastDebugActivityLine else {
+            return
+        }
+
+        lastDebugActivityLine = line
+        print(line)
+        fflush(stdout)
     }
 }
 
